@@ -1,0 +1,4 @@
+pyperclip
+pyzbar
+opencv-python
+openpyxl
