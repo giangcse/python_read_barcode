@@ -2,3 +2,5 @@ pyperclip
 pyzbar
 opencv-python
 openpyxl
+pandas
+pyqt5
