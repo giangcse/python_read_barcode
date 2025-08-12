@@ -5,8 +5,8 @@ a = Analysis(
     ['barcode_reader.py'],
     pathex=[],
     binaries=[],
-    datas=[('libiconv.dll', 'pyzbar'), ('libzbar-64.dll', 'pyzbar')],
-    hiddenimports=['pyzbar', 'opencv-python-headless', 'pyperclip', 'pyqt5'],
+    datas=[('Logo.ico', '.'), ('barcodes.db', '.')],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['barcode-scan.ico'],
+    icon=['Logo.ico'],
 )

@@ -20,14 +20,71 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QSpacerItem,
     QSizePolicy,
+    QGraphicsOpacityEffect,
 )
-from PyQt5.QtCore import Qt, QTimer, QDate
+from PyQt5.QtCore import (
+    Qt,
+    QTimer,
+    QDate,
+    QPropertyAnimation,
+    QEasingCurve,
+    QThread,
+    pyqtSignal,
+)
 from PyQt5.QtGui import QImage, QPixmap, QFont, QPalette, QColor
 from pyzbar import pyzbar
 import winsound  # Thư viện phát âm thanh (Windows)
 import time
 import pyperclip  # Thư viện để sao chép vào clipboard
 from openpyxl import Workbook
+import threading
+from queue import Queue
+
+
+class DatabaseWorker(QThread):
+    """Worker thread để xử lý database operations async"""
+
+    def __init__(self, db_path):
+        super().__init__()
+        self.db_path = db_path
+        self.queue = Queue()
+        self.running = True
+
+    def run(self):
+        """Chạy thread xử lý database"""
+        # Tạo connection riêng cho thread này
+        conn = sqlite3.connect(self.db_path)
+
+        while self.running:
+            try:
+                # Lấy task từ queue với timeout
+                task = self.queue.get(timeout=1)
+                if task is None:
+                    break
+
+                operation, data = task
+                if operation == "save_scan":
+                    content, scanned_at, scan_date, scan_time = data
+                    conn.execute(
+                        "INSERT INTO scans(content, scanned_at, scan_date, scan_time) VALUES(?, ?, ?, ?)",
+                        (content, scanned_at, scan_date, scan_time),
+                    )
+                    conn.commit()
+
+            except:
+                continue  # Timeout hoặc lỗi, tiếp tục loop
+
+        conn.close()
+
+    def add_task(self, operation, data):
+        """Thêm task vào queue"""
+        self.queue.put((operation, data))
+
+    def stop(self):
+        """Dừng worker"""
+        self.running = False
+        self.queue.put(None)
+
 
 class BarcodeReaderApp(QMainWindow):
     def __init__(self):
@@ -50,26 +107,41 @@ class BarcodeReaderApp(QMainWindow):
         self.main_layout.setContentsMargins(20, 20, 20, 20)
 
         # Tạo header
-        self.create_header()
+        # self.create_header()
+
+        # Thêm spacing đẹp hơn
+        self.main_layout.addSpacing(10)
 
         # Tạo vùng control
         self.create_control_panel()
+        self.main_layout.addSpacing(5)
 
         # Tạo vùng hiển thị video
         self.create_video_panel()
+        self.main_layout.addSpacing(5)
 
         # Tạo vùng kết quả
         self.create_result_panel()
+        self.main_layout.addSpacing(10)
 
-        # Khởi tạo webcam
+        # Khởi tạo webcam với tối ưu hiệu suất
         self.capture = cv2.VideoCapture(0)
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        # Giảm resolution để tăng tốc độ xử lý
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # Giảm buffer size để tránh lag
+        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Tăng FPS nếu có thể
+        self.capture.set(cv2.CAP_PROP_FPS, 30)
 
-        # Timer để cập nhật frame
+        # Timer để cập nhật frame - cân bằng giữa hiệu suất và detection
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
-        self.timer.start(30)  # Cập nhật mỗi 30ms
+        self.timer.start(40)  # Cập nhật mỗi 40ms (25 FPS) để balance tốt hơn
+
+        # Cache cho tối ưu detection
+        self.frame_count = 0
+        self.detection_interval = 2  # Giảm interval để detect tốt hơn
 
         # Timer để reset trạng thái
         self.status_timer = QTimer()
@@ -80,8 +152,22 @@ class BarcodeReaderApp(QMainWindow):
         self.last_barcode = None
         self.last_beep_time = 0
 
+        # Hiệu ứng animation cho kết quả
+        self.success_effect = QGraphicsOpacityEffect()
+        self.result_input.setGraphicsEffect(self.success_effect)
+
+        self.success_animation = QPropertyAnimation(self.success_effect, b"opacity")
+        self.success_animation.setDuration(800)
+        self.success_animation.setEasingCurve(QEasingCurve.OutCubic)
+
         # Khởi tạo cơ sở dữ liệu SQLite
         self.init_database()
+
+        # Khởi tạo database worker thread
+        self.db_worker = DatabaseWorker(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "barcodes.db")
+        )
+        self.db_worker.start()
 
         # Áp dụng stylesheet
         self.apply_stylesheet()
@@ -116,8 +202,8 @@ class BarcodeReaderApp(QMainWindow):
         control_layout = QGridLayout(control_group)
 
         # Từ ngày
-        from_label = QLabel("Từ ngày:")
-        from_label.setStyleSheet("font-weight: bold; color: #2c3e50;")
+        from_label = QLabel("📅 Từ ngày:")
+        from_label.setStyleSheet("font-weight: 600; color: #495057; font-size: 13px;")
         self.from_date = QDateEdit()
         self.from_date.setCalendarPopup(True)
         self.from_date.setDisplayFormat("dd/MM/yyyy")
@@ -125,21 +211,48 @@ class BarcodeReaderApp(QMainWindow):
         self.from_date.setStyleSheet(
             """
             QDateEdit {
-                padding: 8px;
-                border: 2px solid #bdc3c7;
-                border-radius: 5px;
-                background-color: white;
-                font-size: 12px;
+                padding: 12px 15px;
+                border: 2px solid #e1e8ed;
+                border-radius: 8px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #ffffff, stop: 1 #f8f9fa);
+                font-size: 13px;
+                font-weight: 500;
+                color: #495057;
+                min-height: 20px;
             }
             QDateEdit:focus {
                 border-color: #3498db;
+                background: #ffffff;
+                box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+            }
+            QDateEdit:hover {
+                border-color: #74b9ff;
+                background: #ffffff;
+            }
+            QDateEdit::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid #e1e8ed;
+                border-top-right-radius: 8px;
+                border-bottom-right-radius: 8px;
+                background: #f8f9fa;
+            }
+            QDateEdit::down-arrow {
+                image: none;
+                border: 2px solid #6c757d;
+                border-radius: 2px;
+                background: #6c757d;
+                width: 8px;
+                height: 8px;
             }
         """
         )
 
         # Đến ngày
-        to_label = QLabel("Đến ngày:")
-        to_label.setStyleSheet("font-weight: bold; color: #2c3e50;")
+        to_label = QLabel("📅 Đến ngày:")
+        to_label.setStyleSheet("font-weight: 600; color: #495057; font-size: 13px;")
         self.to_date = QDateEdit()
         self.to_date.setCalendarPopup(True)
         self.to_date.setDisplayFormat("dd/MM/yyyy")
@@ -147,14 +260,41 @@ class BarcodeReaderApp(QMainWindow):
         self.to_date.setStyleSheet(
             """
             QDateEdit {
-                padding: 8px;
-                border: 2px solid #bdc3c7;
-                border-radius: 5px;
-                background-color: white;
-                font-size: 12px;
+                padding: 12px 15px;
+                border: 2px solid #e1e8ed;
+                border-radius: 8px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #ffffff, stop: 1 #f8f9fa);
+                font-size: 13px;
+                font-weight: 500;
+                color: #495057;
+                min-height: 20px;
             }
             QDateEdit:focus {
                 border-color: #3498db;
+                background: #ffffff;
+                box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+            }
+            QDateEdit:hover {
+                border-color: #74b9ff;
+                background: #ffffff;
+            }
+            QDateEdit::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid #e1e8ed;
+                border-top-right-radius: 8px;
+                border-bottom-right-radius: 8px;
+                background: #f8f9fa;
+            }
+            QDateEdit::down-arrow {
+                image: none;
+                border: 2px solid #6c757d;
+                border-radius: 2px;
+                background: #6c757d;
+                width: 8px;
+                height: 8px;
             }
         """
         )
@@ -165,19 +305,28 @@ class BarcodeReaderApp(QMainWindow):
         self.export_btn.setStyleSheet(
             """
             QPushButton {
-                background-color: #27ae60;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #00b894, stop: 1 #00a085);
                 color: white;
                 border: none;
-                padding: 10px 20px;
-                border-radius: 5px;
-                font-weight: bold;
-                font-size: 12px;
+                padding: 12px 24px;
+                border-radius: 10px;
+                font-weight: 600;
+                font-size: 13px;
+                min-height: 20px;
+                box-shadow: 0 4px 15px rgba(0, 184, 148, 0.3);
             }
             QPushButton:hover {
-                background-color: #2ecc71;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #00d4aa, stop: 1 #00b894);
+                transform: translateY(-2px);
+                box-shadow: 0 6px 20px rgba(0, 184, 148, 0.4);
             }
             QPushButton:pressed {
-                background-color: #229954;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #00a085, stop: 1 #008f75);
+                transform: translateY(0px);
+                box-shadow: 0 2px 8px rgba(0, 184, 148, 0.2);
             }
         """
         )
@@ -202,9 +351,12 @@ class BarcodeReaderApp(QMainWindow):
         self.video_label.setStyleSheet(
             """
             QLabel {
-                border: 3px solid #bdc3c7;
-                border-radius: 10px;
-                background-color: #ecf0f1;
+                border: 2px solid #e1e8ed;
+                border-radius: 15px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #f8f9fa, stop: 1 #e9ecef);
+                padding: 10px;
+                box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.1);
             }
         """
         )
@@ -242,17 +394,27 @@ class BarcodeReaderApp(QMainWindow):
         self.result_input.setStyleSheet(
             """
             QLineEdit {
-                padding: 15px;
-                border: 2px solid #3498db;
-                border-radius: 8px;
-                background-color: #f8f9fa;
-                font-size: 16px;
-                font-weight: bold;
-                color: #2c3e50;
+                padding: 18px 20px;
+                border: 2px solid #74b9ff;
+                border-radius: 12px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #ffffff, stop: 1 #f1f3f4);
+                font-size: 18px;
+                font-weight: 600;
+                color: #2d3436;
+                font-family: 'Consolas', 'Monaco', monospace;
+                min-height: 25px;
+                box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.05);
             }
             QLineEdit:focus {
-                border-color: #2980b9;
-                background-color: white;
+                border-color: #0984e3;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #ffffff, stop: 1 #e3f2fd);
+                box-shadow: 0 0 0 3px rgba(9, 132, 227, 0.1);
+            }
+            QLineEdit[text=""]:!focus {
+                color: #636e72;
+                font-style: italic;
             }
         """
         )
@@ -276,28 +438,41 @@ class BarcodeReaderApp(QMainWindow):
         self.main_layout.addWidget(result_group)
 
     def apply_stylesheet(self):
-        """Áp dụng stylesheet cho toàn bộ ứng dụng"""
+        """Áp dụng stylesheet tối ưu cho toàn bộ ứng dụng"""
+        # Dùng stylesheet đơn giản hơn để giảm overhead
         self.setStyleSheet(
             """
             QMainWindow {
                 background-color: #f5f6fa;
-            }
-            QGroupBox {
-                font-weight: bold;
-                font-size: 13px;
                 color: #2c3e50;
-                border: 2px solid #bdc3c7;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 10px;
+                font-family: 'Segoe UI', Arial, sans-serif;
             }
+            
+            QGroupBox {
+                font-weight: 600;
+                font-size: 14px;
+                color: #2c3e50;
+                border: 1px solid #d0d7de;
+                border-radius: 10px;
+                margin-top: 12px;
+                padding-top: 15px;
+                background-color: #ffffff;
+            }
+            
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
+                left: 15px;
+                padding: 5px 10px;
+                background-color: #ffffff;
+                border: 1px solid #e1e8ed;
+                border-radius: 6px;
+                color: #495057;
+                font-weight: 600;
             }
+            
             QLabel {
-                color: #2c3e50;
+                color: #495057;
+                font-weight: 500;
             }
         """
         )
@@ -341,7 +516,7 @@ class BarcodeReaderApp(QMainWindow):
         self.conn.commit()
 
     def save_scan(self, content: str) -> None:
-        """Lưu một dòng quét vào DB với thời gian hệ thống."""
+        """Lưu một dòng quét vào DB với thời gian hệ thống (đồng bộ)."""
         now = datetime.now()
         scanned_at = now.strftime("%Y-%m-%d %H:%M:%S")
         scan_date = now.strftime("%Y-%m-%d")
@@ -351,6 +526,18 @@ class BarcodeReaderApp(QMainWindow):
             (content, scanned_at, scan_date, scan_time),
         )
         self.conn.commit()
+
+    def save_scan_async(self, content: str) -> None:
+        """Lưu một dòng quét vào DB async để không block UI."""
+        now = datetime.now()
+        scanned_at = now.strftime("%Y-%m-%d %H:%M:%S")
+        scan_date = now.strftime("%Y-%m-%d")
+        scan_time = now.strftime("%H:%M:%S")
+
+        # Gửi task vào queue để xử lý async
+        self.db_worker.add_task(
+            "save_scan", (content, scanned_at, scan_date, scan_time)
+        )
 
     def export_to_excel(self) -> None:
         """Xuất dữ liệu từ DB theo khoảng ngày ra file Excel (.xlsx)."""
@@ -463,71 +650,9 @@ class BarcodeReaderApp(QMainWindow):
             msg.exec_()
 
     def update_frame(self):
+        """Cập nhật frame với tối ưu hiệu suất"""
         ret, frame = self.capture.read()
-        if ret:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # Đọc barcode từ frame
-            barcodes = pyzbar.decode(gray)
-
-            # Nếu phát hiện barcode
-            for barcode in barcodes:
-                barcode_data = barcode.data.decode("utf-8")
-
-                # Kiểm tra barcode có đúng định dạng không
-                if True:
-                    # Chỉ phát âm thanh, cập nhật và copy nếu barcode mới hoặc sau 1 giây
-                    current_time = time.time()
-                    if barcode_data != self.last_barcode or (current_time - self.last_beep_time > 1):
-                        self.result_input.setText(barcode_data)
-                        self.play_beep_sound()
-                        pyperclip.copy(barcode_data)  # Sao chép barcode vào clipboard
-                        self.save_scan(barcode_data)  # Lưu vào DB
-                        self.last_barcode = barcode_data
-                        self.last_beep_time = current_time
-
-                        # Cập nhật trạng thái
-                        self.status_label.setText("✅ Đã đọc thành công barcode!")
-                        self.status_label.setStyleSheet(
-                            """
-                            QLabel {
-                                color: #27ae60;
-                                font-weight: bold;
-                                font-size: 12px;
-                                padding: 5px;
-                            }
-                        """
-                        )
-                        # Reset trạng thái sau 3 giây
-                        self.status_timer.start(3000)
-
-                # Vẽ khung bao quanh barcode với màu sắc đẹp hơn
-                (x, y, w, h) = barcode.rect
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
-                # Thêm text "BARCODE" phía trên khung
-                cv2.putText(
-                    frame,
-                    "BARCODE",
-                    (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                )
-
-            # Chuyển frame sang định dạng RGB
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # Chuyển thành QImage
-            h, w, ch = frame.shape
-            bytes_per_line = ch * w
-            image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-
-            # Chuyển thành QPixmap và hiển thị
-            pixmap = QPixmap.fromImage(image)
-            scaled_pixmap = pixmap.scaled(
-                self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            self.video_label.setPixmap(scaled_pixmap)
-        else:
+        if not ret:
             # Nếu không đọc được camera
             self.status_label.setText("❌ Không thể kết nối camera")
             self.status_label.setStyleSheet(
@@ -540,6 +665,193 @@ class BarcodeReaderApp(QMainWindow):
                 }
             """
             )
+            return
+
+        # Tăng frame counter
+        self.frame_count += 1
+
+        # Chỉ detect barcode mỗi vài frame để tối ưu CPU
+        barcodes = []
+        if self.frame_count % self.detection_interval == 0:
+            # Tăng kích thước frame detection để đọc barcode tốt hơn
+            detection_frame = cv2.resize(frame, (480, 360))  # Tăng từ 320x240
+            gray = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2GRAY)
+
+            # Cải thiện chất lượng ảnh cho detection
+            # Tăng contrast
+            gray = cv2.convertScaleAbs(gray, alpha=1.2, beta=10)
+
+            # Blur nhẹ để giảm noise
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+            # Detection với pyzbar
+            barcodes = pyzbar.decode(gray)
+
+            # Nếu không tìm thấy, thử với frame gốc (fallback)
+            if not barcodes:
+                original_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                barcodes = pyzbar.decode(original_gray)
+                # Nếu tìm thấy với frame gốc, không cần scale coordinates
+                if barcodes:
+                    self.use_original_coords = True
+                    print("Detected barcode using original frame")
+                else:
+                    self.use_original_coords = False
+            else:
+                self.use_original_coords = False
+                print("Detected barcode using processed frame")
+
+        # Xử lý barcode nếu tìm thấy
+        for barcode in barcodes:
+            try:
+                barcode_data = barcode.data.decode("utf-8")
+
+                # Chỉ xử lý nếu barcode mới hoặc sau 1 giây
+                current_time = time.time()
+                if barcode_data != self.last_barcode or (
+                    current_time - self.last_beep_time > 1
+                ):
+                    self.result_input.setText(barcode_data)
+                    self.play_beep_sound()
+                    pyperclip.copy(barcode_data)
+                    self.save_scan_async(barcode_data)  # Lưu DB async
+                    self.last_barcode = barcode_data
+                    self.last_beep_time = current_time
+
+                    # Cập nhật trạng thái
+                    self.status_label.setText("✅ Đã đọc thành công barcode!")
+                    self.status_label.setStyleSheet(
+                        """
+                        QLabel {
+                            color: #27ae60;
+                            font-weight: bold;
+                            font-size: 12px;
+                            padding: 5px;
+                        }
+                    """
+                    )
+                    self.status_timer.start(3000)
+                    self.animate_success()
+
+                # Vẽ khung bao quanh barcode
+                (x, y, w, h) = barcode.rect
+
+                # Scale coordinates nếu cần thiết
+                if (
+                    not hasattr(self, "use_original_coords")
+                    or not self.use_original_coords
+                ):
+                    # Scale từ detection frame (480x360) về frame gốc (640x480)
+                    scale_x, scale_y = frame.shape[1] / 480, frame.shape[0] / 360
+                    x, y, w, h = (
+                        int(x * scale_x),
+                        int(y * scale_y),
+                        int(w * scale_x),
+                        int(h * scale_y),
+                    )
+
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(
+                    frame,
+                    "BARCODE",
+                    (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+
+            except Exception as e:
+                print(f"Lỗi decode barcode: {e}")
+
+        # Tối ưu hiển thị frame
+        self.display_frame(frame)
+
+    def display_frame(self, frame):
+        """Hiển thị frame với tối ưu memory"""
+        # Chuyển sang RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Tạo QImage
+        h, w, ch = frame_rgb.shape
+        bytes_per_line = ch * w
+
+        # Tối ưu QImage creation
+        qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+
+        # Scale với tối ưu
+        pixmap = QPixmap.fromImage(qt_image)
+        label_size = self.video_label.size()
+
+        # Chỉ scale nếu cần thiết
+        if pixmap.size() != label_size:
+            scaled_pixmap = pixmap.scaled(
+                label_size,
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation,  # Dùng FastTransformation thay vì SmoothTransformation
+            )
+            self.video_label.setPixmap(scaled_pixmap)
+        else:
+            self.video_label.setPixmap(pixmap)
+
+    def animate_success(self):
+        """Tạo hiệu ứng khi đọc barcode thành công"""
+        # Hiệu ứng nhấp nháy
+        self.success_animation.setStartValue(0.3)
+        self.success_animation.setEndValue(1.0)
+        self.success_animation.start()
+
+        # Thay đổi style tạm thời
+        self.result_input.setStyleSheet(
+            """
+            QLineEdit {
+                padding: 18px 20px;
+                border: 2px solid #00b894;
+                border-radius: 12px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #d4f9f0, stop: 1 #a8e6cf);
+                font-size: 18px;
+                font-weight: 600;
+                color: #00695c;
+                font-family: 'Consolas', 'Monaco', monospace;
+                min-height: 25px;
+                box-shadow: 0 0 15px rgba(0, 184, 148, 0.4);
+            }
+        """
+        )
+
+        # Timer để trở về style bình thường
+        QTimer.singleShot(1500, self.reset_result_style)
+
+    def reset_result_style(self):
+        """Reset style của result input về bình thường"""
+        self.result_input.setStyleSheet(
+            """
+            QLineEdit {
+                padding: 18px 20px;
+                border: 2px solid #74b9ff;
+                border-radius: 12px;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #ffffff, stop: 1 #f1f3f4);
+                font-size: 18px;
+                font-weight: 600;
+                color: #2d3436;
+                font-family: 'Consolas', 'Monaco', monospace;
+                min-height: 25px;
+                box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.05);
+            }
+            QLineEdit:focus {
+                border-color: #0984e3;
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #ffffff, stop: 1 #e3f2fd);
+                box-shadow: 0 0 0 3px rgba(9, 132, 227, 0.1);
+            }
+            QLineEdit[text=""]:!focus {
+                color: #636e72;
+                font-style: italic;
+            }
+        """
+        )
 
     def reset_status(self):
         """Reset trạng thái về mặc định"""
@@ -568,18 +880,28 @@ class BarcodeReaderApp(QMainWindow):
             pass  # Bỏ qua nếu không thể phát âm thanh
 
     def closeEvent(self, event):
-        """Xử lý khi đóng ứng dụng"""
+        """Xử lý khi đóng ứng dụng với cleanup tối ưu"""
         # Dừng timers
         if hasattr(self, "timer"):
             self.timer.stop()
         if hasattr(self, "status_timer"):
             self.status_timer.stop()
 
-        # Giải phóng webcam khi đóng ứng dụng
+        # Dừng animation
+        if hasattr(self, "success_animation"):
+            self.success_animation.stop()
+
+        # Giải phóng webcam
         if hasattr(self, "capture"):
             self.capture.release()
+            cv2.destroyAllWindows()  # Đóng tất cả cửa sổ OpenCV
 
-        # Đóng kết nối database
+        # Dừng database worker thread
+        if hasattr(self, "db_worker"):
+            self.db_worker.stop()
+            self.db_worker.wait(3000)  # Đợi tối đa 3 giây
+
+        # Đóng kết nối database chính
         try:
             if hasattr(self, "conn"):
                 self.conn.close()
