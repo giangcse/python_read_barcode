@@ -43,6 +43,16 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 from queue import Queue
 
+def get_base_path():
+    """Lấy đường dẫn cơ sở, hoạt động cho cả script và file .exe từ PyInstaller"""
+    if getattr(sys, 'frozen', False):
+        # Chạy từ file .exe đã được đóng gói
+        base_path = os.path.dirname(sys.executable)
+    else:
+        # Chạy từ file .py bình thường
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return base_path
+
 class DatabaseWorker(QThread):
     # 2. TẠO MỘT TÍN HIỆU (SIGNAL)
     scan_saved = pyqtSignal() 
@@ -139,7 +149,7 @@ class BarcodeReaderApp(QMainWindow):
 
         self.init_database()
 
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "barcodes.db")
+        db_path = os.path.join(get_base_path(), "barcodes.db")
         self.db_worker = DatabaseWorker(db_path)
         self.db_worker.start()
 
@@ -227,7 +237,7 @@ class BarcodeReaderApp(QMainWindow):
         """)
 
     def init_database(self):
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "barcodes.db")
+        db_path = os.path.join(get_base_path(), "barcodes.db")
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS scans (
